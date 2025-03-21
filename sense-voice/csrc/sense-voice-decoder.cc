@@ -60,7 +60,7 @@ struct ggml_cgraph *sense_voice_build_graph_ctc_decoder(sense_voice_context &ctx
     ggml_cgraph *gf = ggml_new_graph_custom(ctx0, SENSEVOICE_DECODER_MAX_NODES, false);
 
     ggml_tensor *encoder_out = ggml_new_tensor_3d(ctx0, state.encoder_out->type,
-                                                  state.encoder_out->ne[0], state.encoder_out->ne[1], 
+                                                  state.encoder_out->ne[0], state.encoder_out->ne[1],
                                                   state.encoder_out->ne[2]);
     ggml_set_name(encoder_out, "encoder_out");
     ggml_set_input(encoder_out);
@@ -76,11 +76,9 @@ struct ggml_cgraph *sense_voice_build_graph_ctc_decoder(sense_voice_context &ctx
     }
     ggml_tensor * probs = ggml_soft_max(ctx0, cur);
     probs = ggml_reshape_2d(ctx0, probs, probs->ne[0], probs->ne[1] * probs->ne[2] * probs->ne[3]);
-    ggml_tensor * argmax_logit = ggml_argmax(ctx0, probs);
-    argmax_logit = ggml_reshape_3d(ctx0, argmax_logit, cur->ne[1], cur->ne[2], cur->ne[3]);
+    probs = ggml_reshape_3d(ctx0, ggml_argmax(ctx0, probs), cur->ne[1], cur->ne[2], cur->ne[3]);  // argmax_logit
     ggml_set_output(probs);
-    ggml_set_output(argmax_logit);
-    ggml_build_forward_expand(gf, argmax_logit);
+    ggml_build_forward_expand(gf, probs);
     ggml_free(ctx0);
     return gf;
 }
@@ -124,14 +122,11 @@ bool sense_voice_decode_internal(sense_voice_context &ctx,
                 ggml_backend_tensor_get(argmax_logit, state.ids.data(), 0, sizeof(int) * argmax_logit->ne[0]);
             }
             else {
-                const int32_t n_logits = argmax_logit->ne[0] * argmax_logit->ne[1];
                 // Get the tensor data into a temporary buffer
-                std::vector<int> temp_buffer(n_logits);
-                ggml_backend_tensor_get(argmax_logit, temp_buffer.data(), 0, sizeof(int) * n_logits);
                 for(int32_t i = 0; i < argmax_logit->ne[1]; i++)
                 {
-                    int posL = i * argmax_logit->ne[0];
-                    state.result_all[state.segmentIDs[i]].tokens = std::vector<int>(temp_buffer.begin() + posL, temp_buffer.begin() + posL + argmax_logit->ne[0]);
+                    state.result_all[state.segmentIDs[i]].tokens.resize(argmax_logit->ne[0]);
+                    ggml_backend_tensor_get(argmax_logit, state.result_all[state.segmentIDs[i]].tokens.data(), sizeof(int) * i * argmax_logit->ne[0], sizeof(int) * argmax_logit->ne[0]);
                 }
             }
         }

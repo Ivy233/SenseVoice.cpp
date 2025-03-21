@@ -828,7 +828,6 @@ int sense_voice_batch_pcm_to_feature_with_state(struct sense_voice_context *ctx,
                                                           ggml_nbytes(state->feature.tensor) + ggml_backend_get_alignment(state->backends[0]));
         auto alloc = ggml_tallocr_new(state->feature.buffer);
         ggml_tallocr_alloc(&alloc, state->feature.tensor);
-
         auto &feature = state->feature.tensor;
 
         assert(state->feature.n_mel == ctx->model.hparams.n_mels);
@@ -894,7 +893,7 @@ int sense_voice_batch_full(struct sense_voice_context *ctx, const sense_voice_fu
 
 int sense_voice_batch_pcmf(struct sense_voice_context *ctx, const sense_voice_full_params &params, std::vector<std::vector<double>> &pcmf32,
                            size_t max_batch_len, size_t max_batch_cnt,
-                           bool use_prefix, bool use_itn) 
+                           bool use_prefix, bool use_itn)
 {
     // 还是要有ctx，重复生成会重复读取模型，有点耗性能
     // ctx中的参数需要在外面赋值，外面的参数形态各异，带不进来
