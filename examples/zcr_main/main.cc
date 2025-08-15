@@ -3,6 +3,7 @@
 //
 #include "common.h"
 #include "sense-voice.h"
+#include "silero-vad.h"
 #include <cmath>
 #include <cstdint>
 #include <thread>
@@ -286,6 +287,12 @@ void sense_voice_free(struct sense_voice_context *ctx) {
     if (ctx) {
         ggml_free(ctx->model.ctx);
         ggml_backend_buffer_free(ctx->model.buffer);
+
+        // 释放VAD相关资源
+        ggml_free(ctx->state->vad_ctx);
+        ggml_backend_buffer_free(ctx->state->vad_lstm_hidden_state_buffer);
+        ggml_backend_buffer_free(ctx->state->vad_lstm_context_buffer);
+
         sense_voice_free_state(ctx->state);
         delete ctx->model.model->encoder;
         delete ctx->model.model;
@@ -301,7 +308,38 @@ void sense_voice_split_segments(struct sense_voice_context *ctx, const sense_voi
     // const bool use_vad = (n_samples_step <= 0);
     for (int i = 0; i < int(pcmf32.size()); i += n_sample_step) {
         int R_this_chunk = std::min(i + n_sample_step, int(pcmf32.size()));
-        bool isnomute = vad_energy_zcr<double>(pcmf32.begin() + i, R_this_chunk - i, SENSE_VOICE_SAMPLE_RATE);
+        bool isnomute = false;
+
+        // 使用silero-vad进行语音检测
+        const int vad_chunk_size = 640; // VAD_CHUNK_SIZE
+        const int context_size = 576;
+        const int pad_size = 64;
+
+        // 准备640大小的chunk数据
+        std::vector<float> chunk(vad_chunk_size, 0);
+        int start_idx = i;
+
+        // 填充chunk数据，处理边界情况
+        for (int j = 0; j < vad_chunk_size; j++) {
+            int actual_idx = start_idx + j - pad_size;
+            if (actual_idx >= 0 && actual_idx < pcmf32.size()) {
+                chunk[j] = static_cast<float>(pcmf32[actual_idx]);
+            } else if (actual_idx < 0) {
+                // 反射填充
+                int reflect_idx = -actual_idx - 1;
+                if (reflect_idx < pcmf32.size()) {
+                    chunk[j] = static_cast<float>(pcmf32[reflect_idx]);
+                }
+            }
+        }
+
+        float speech_prob = 0;
+        if (silero_vad_encode_internal(*ctx, *ctx->state, chunk, params.n_threads, speech_prob)) {
+            isnomute = (speech_prob >= 0.5); // 默认阈值0.5
+        } else {
+            // 如果VAD失败，回退到能量检测
+            isnomute = vad_energy_zcr<double>(pcmf32.begin() + i, R_this_chunk - i, SENSE_VOICE_SAMPLE_RATE);
+        }
 
         // fprintf(stderr, "Mute || L_mute = %d, R_Mute = %d, L_nomute = %d, R_this_chunk = %d, keep_nomute_step = %d\n", L_mute, R_mute, L_nomute, R_this_chunk, keep_nomute_step);
         if (L_nomute >= 0 && R_this_chunk - L_nomute >= max_nomute_step) {
@@ -415,6 +453,29 @@ int main(int argc, char **argv) {
     }
 
     ctx->language_id = sense_voice_lang_id(params.language.c_str());
+
+        // 初始化silero-vad状态
+    const int VAD_LSTM_STATE_MEMORY_SIZE = 256*1024;
+    const int VAD_LSTM_STATE_DIM = 128;
+
+    ctx->state->vad_ctx = ggml_init({VAD_LSTM_STATE_MEMORY_SIZE, nullptr, true});
+    ctx->state->vad_lstm_context = ggml_new_tensor_1d(ctx->state->vad_ctx, GGML_TYPE_F32, VAD_LSTM_STATE_DIM);
+    ctx->state->vad_lstm_hidden_state = ggml_new_tensor_1d(ctx->state->vad_ctx, GGML_TYPE_F32, VAD_LSTM_STATE_DIM);
+
+    ctx->state->vad_lstm_context_buffer = ggml_backend_alloc_buffer(ctx->state->backends[0],
+                                                                    ggml_nbytes(ctx->state->vad_lstm_context)
+                                                                            + ggml_backend_get_alignment(ctx->state->backends[0]));
+    ctx->state->vad_lstm_hidden_state_buffer = ggml_backend_alloc_buffer(ctx->state->backends[0],
+                                                                         ggml_nbytes(ctx->state->vad_lstm_hidden_state)
+                                                                                 + ggml_backend_get_alignment(ctx->state->backends[0]));
+    auto context_alloc = ggml_tallocr_new(ctx->state->vad_lstm_context_buffer);
+    ggml_tallocr_alloc(&context_alloc, ctx->state->vad_lstm_context);
+
+    auto state_alloc = ggml_tallocr_new(ctx->state->vad_lstm_hidden_state_buffer);
+    ggml_tallocr_alloc(&state_alloc, ctx->state->vad_lstm_hidden_state);
+
+    ggml_set_zero(ctx->state->vad_lstm_context);
+    ggml_set_zero(ctx->state->vad_lstm_hidden_state);
 
     for (int f = 0; f < (int) params.fname_inp.size(); ++f) {
         const auto fname_inp = params.fname_inp[f];
