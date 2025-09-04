@@ -687,6 +687,17 @@ int sense_voice_pcm_to_feature_with_state(struct sense_voice_context *ctx,
 
     // set input
     {
+        // 释放之前的资源以防止内存泄漏
+        if (state->feature.ctx) {
+            ggml_free(state->feature.ctx);
+            state->feature.ctx = nullptr;
+        }
+        if (state->feature.buffer) {
+            ggml_backend_buffer_free(state->feature.buffer);
+            state->feature.buffer = nullptr;
+        }
+        state->feature.tensor = nullptr;
+        
         // init features
         state->feature.n_len = state->feature.data.size() / (state->feature.n_mel * state->feature.lfr_m);
         state->feature.ctx = ggml_init({ggml_tensor_overhead(), nullptr, true});
@@ -816,6 +827,17 @@ int sense_voice_batch_pcm_to_feature_with_state(struct sense_voice_context *ctx,
 
     // set input
     {
+        // 释放之前的资源以防止内存泄漏
+        if (state->feature.ctx) {
+            ggml_free(state->feature.ctx);
+            state->feature.ctx = nullptr;
+        }
+        if (state->feature.buffer) {
+            ggml_backend_buffer_free(state->feature.buffer);
+            state->feature.buffer = nullptr;
+        }
+        state->feature.tensor = nullptr;
+        
         // init features
         state->feature.n_len = state->feature.data.size() / (state->feature.n_mel * state->feature.lfr_m);
         state->feature.ctx = ggml_init({ggml_tensor_overhead(), nullptr, true});

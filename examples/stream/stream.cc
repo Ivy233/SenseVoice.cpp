@@ -213,6 +213,11 @@ int main(int argc, char **argv) {
     std::vector<double> pcmf32;
     std::vector<double> pcmf32_tmp;// 传递给模型用
 
+    // 预留合理的容量，避免频繁的内存重分配
+    pcmf32.reserve(max_nomute_step * 2);
+    pcmf32_audio.reserve(params.chunk_size * SENSE_VOICE_SAMPLE_RATE / 1000 * 4); // 预留4个chunk的空间
+    pcmf32_tmp.reserve(max_nomute_step); // 为临时处理预留空间
+
     // 文本输出文件
     std::ofstream fout;
     if (params.fname_out.length() > 0) {
@@ -340,7 +345,8 @@ int main(int argc, char **argv) {
             // 时间长度太长了直接换行重新开始
             if (R_new_chunk >= max_nomute_step + idenitified_floats) {
                 printf("\n");
-                pcmf32_tmp = std::vector<double>(pcmf32.begin() + R_new_chunk - idenitified_floats, pcmf32.end());
+                // 优化：使用assign而不是重新构造vector
+                pcmf32_tmp.assign(pcmf32.begin() + R_new_chunk - idenitified_floats, pcmf32.end());
                 pcmf32 = pcmf32_tmp;
                 idenitified_floats = R_new_chunk;
             }
@@ -466,14 +472,23 @@ int main(int argc, char **argv) {
             }
             // 调整idenitified_floats并且减少pcmf32的长度
             if (nomute.second > 0) {
-                pcmf32_tmp = std::vector<double>(pcmf32.begin() + (nomute.second - idenitified_floats), pcmf32.end());
+                // 优化：使用assign而不是重新构造vector
+                pcmf32_tmp.assign(pcmf32.begin() + (nomute.second - idenitified_floats), pcmf32.end());
                 pcmf32 = pcmf32_tmp;
                 idenitified_floats = nomute.second;
                 nomute.second = 0;
             } else if (nomute.first == -1) {
-                pcmf32_tmp = std::vector<double>(pcmf32.begin() + (R_new_chunk - idenitified_floats), pcmf32.end());
+                // 优化：使用assign而不是重新构造vector
+                pcmf32_tmp.assign(pcmf32.begin() + (R_new_chunk - idenitified_floats), pcmf32.end());
                 pcmf32 = pcmf32_tmp;
                 idenitified_floats = R_new_chunk;
+            }
+
+            // 检查缓冲区大小并发出警告
+            if (pcmf32.size() > 2 * max_nomute_step) {
+                fprintf(stderr, "Warning: Audio buffer size (%.2f MB, %.2f sec) exceeds recommended limit. Consider optimizing processing speed.\n",
+                       pcmf32.size() * sizeof(double) / 1e6,
+                       pcmf32.size() / (double)SENSE_VOICE_SAMPLE_RATE);
             }
         }
         fflush(stdout);
