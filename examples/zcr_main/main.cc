@@ -24,12 +24,13 @@ struct sense_voice_params {
     int32_t max_context = -1;
     int32_t n_mel = 80;
     int32_t audio_ctx = 0;
-    size_t chunk_size = 100;                        // ms
+    size_t chunk_size = 50;                        // ms
     size_t max_nomute_chunks = 30000 / chunk_size;  // chunks
     size_t min_mute_chunks = 1000 / chunk_size;     // chunks
     size_t max_chunks_in_batch = 90000 / chunk_size;// chunks
     size_t max_batch = 4;
 
+    float speech_prob_threshold = 0.1f;           // speech probability threshold
     bool debug_mode = false;
     bool no_prints = false;
     bool use_gpu = true;
@@ -115,6 +116,7 @@ static void sense_voice_print_usage(int /*argc*/, char **argv, const sense_voice
     fprintf(stderr, "  -mnc       --max-nomute-chunks [%-7lu] when the first non-silent chunk is too far away\n", params.max_nomute_chunks);
     fprintf(stderr, "             --maxchunk-in-batch [%-7lu] the number of cutted audio can be processed at one time\n", params.max_chunks_in_batch);
     fprintf(stderr, "  -b         --batch             [%-7lu] the number of cutted audio can be processed at one time\n", params.max_batch);
+    fprintf(stderr, "  -spt       --speech-prob-threshold [%-7.3f] speech probability threshold for VAD\n", params.speech_prob_threshold);
     fprintf(stderr, "\n");
 }
 
@@ -200,6 +202,8 @@ static bool sense_voice_params_parse(int argc, char **argv, sense_voice_params &
             params.chunk_size = std::stoi(argv[++i]);
         } else if (arg == "--outfile" || arg == "-fout") {
             params.outfile = argv[++i];
+        } else if (arg == "-spt" || arg == "--speech-prob-threshold") {
+            params.speech_prob_threshold = std::stof(argv[++i]);
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
             sense_voice_print_usage(argc, argv, params);
@@ -288,10 +292,21 @@ void sense_voice_free(struct sense_voice_context *ctx) {
         ggml_free(ctx->model.ctx);
         ggml_backend_buffer_free(ctx->model.buffer);
 
-        // 释放VAD相关资源
-        ggml_free(ctx->state->vad_ctx);
-        ggml_backend_buffer_free(ctx->state->vad_lstm_hidden_state_buffer);
-        ggml_backend_buffer_free(ctx->state->vad_lstm_context_buffer);
+        // 释放VAD相关资源 - 添加空指针检查
+        if (ctx->state) {
+            if (ctx->state->vad_ctx) {
+                ggml_free(ctx->state->vad_ctx);
+                ctx->state->vad_ctx = nullptr;
+            }
+            if (ctx->state->vad_lstm_hidden_state_buffer) {
+                ggml_backend_buffer_free(ctx->state->vad_lstm_hidden_state_buffer);
+                ctx->state->vad_lstm_hidden_state_buffer = nullptr;
+            }
+            if (ctx->state->vad_lstm_context_buffer) {
+                ggml_backend_buffer_free(ctx->state->vad_lstm_context_buffer);
+                ctx->state->vad_lstm_context_buffer = nullptr;
+            }
+        }
 
         sense_voice_free_state(ctx->state);
         delete ctx->model.model->encoder;
@@ -310,32 +325,29 @@ void sense_voice_split_segments(struct sense_voice_context *ctx, const sense_voi
         int R_this_chunk = std::min(i + n_sample_step, int(pcmf32.size()));
         bool isnomute = false;
 
-        // 使用silero-vad进行语音检测
-        const int vad_chunk_size = 640; // VAD_CHUNK_SIZE
-        const int context_size = 576;
-        const int pad_size = 64;
+        // 修复silero-vad的chunk数据准备，确保与原始方法处理相同的数据范围
+        int actual_chunk_size = R_this_chunk - i;  // 使用与能量检测相同的chunk大小
 
-        // 准备640大小的chunk数据
+        // 准备与原始方法相同大小的chunk数据，但最少640样本以满足VAD要求
+        int vad_chunk_size = std::max(640, actual_chunk_size);
         std::vector<float> chunk(vad_chunk_size, 0);
-        int start_idx = i;
 
-        // 填充chunk数据，处理边界情况
-        for (int j = 0; j < vad_chunk_size; j++) {
-            int actual_idx = start_idx + j - pad_size;
-            if (actual_idx >= 0 && actual_idx < pcmf32.size()) {
-                chunk[j] = static_cast<float>(pcmf32[actual_idx]);
-            } else if (actual_idx < 0) {
-                // 反射填充
-                int reflect_idx = -actual_idx - 1;
-                if (reflect_idx < pcmf32.size()) {
-                    chunk[j] = static_cast<float>(pcmf32[reflect_idx]);
-                }
+        // 填充实际的音频数据（确保索引正确）
+        for (int j = 0; j < actual_chunk_size && i + j < int(pcmf32.size()); j++) {
+            chunk[j] = static_cast<float>(pcmf32[i + j]) / 32768.0f;
+        }
+
+        // 如果chunk不够640样本，用最后一个样本填充（而不是反射填充）
+        if (actual_chunk_size < 640) {
+            float last_sample = (actual_chunk_size > 0) ? chunk[actual_chunk_size - 1] : 0.0f;
+            for (int j = actual_chunk_size; j < 640; j++) {
+                chunk[j] = last_sample;
             }
         }
 
         float speech_prob = 0;
         if (silero_vad_encode_internal(*ctx, *ctx->state, chunk, params.n_threads, speech_prob)) {
-            isnomute = (speech_prob >= 0.5); // 默认阈值0.5
+            isnomute = (speech_prob >= params.speech_prob_threshold);
         } else {
             // 如果VAD失败，回退到能量检测
             isnomute = vad_energy_zcr<double>(pcmf32.begin() + i, R_this_chunk - i, SENSE_VOICE_SAMPLE_RATE);
@@ -455,7 +467,7 @@ int main(int argc, char **argv) {
     ctx->language_id = sense_voice_lang_id(params.language.c_str());
 
         // 初始化silero-vad状态
-    const int VAD_LSTM_STATE_MEMORY_SIZE = 256*1024;
+    const int VAD_LSTM_STATE_MEMORY_SIZE = 2048;
     const int VAD_LSTM_STATE_DIM = 128;
 
     ctx->state->vad_ctx = ggml_init({VAD_LSTM_STATE_MEMORY_SIZE, nullptr, true});
