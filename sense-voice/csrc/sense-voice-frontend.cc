@@ -284,6 +284,53 @@ bool load_wav_file(const char *filename, int32_t *sampling_rate,
     free(speech_buff);
     return false;
   }
-
 }
 
+bool load_wav_file(const char *filename, int32_t *sampling_rate,
+                   std::vector<float> &data) {
+  struct WaveHeader header {};
+
+  std::ifstream is(filename, std::ifstream::binary);
+  is.read(reinterpret_cast<char *>(&header), sizeof(header));
+  if (!is) {
+    std::cout << "Failed to read " << filename;
+    return false;
+  }
+
+  if (!header.Validate()) {
+    return false;
+  }
+
+  header.SeekToDataChunk(is);
+  if (!is) {
+    return false;
+  }
+
+  *sampling_rate = header.sample_rate;
+  // header.subchunk2_size contains the number of bytes in the data.
+  // As we assume each sample contains two bytes, so it is divided by 2 here
+  auto speech_len = header.subchunk2_size / 2;
+  data.resize(speech_len);
+
+  auto speech_buff = (int16_t *)malloc(sizeof(int16_t) * speech_len);
+
+  if (speech_buff) {
+    memset(speech_buff, 0, sizeof(int16_t) * speech_len);
+    is.read(reinterpret_cast<char *>(speech_buff), header.subchunk2_size);
+    if (!is) {
+      std::cout << "Failed to read " << filename;
+      return false;
+    }
+
+//    float scale = 32768;
+    float scale = 1.0;
+    for (int32_t i = 0; i != speech_len; ++i) {
+      data[i] = (float)speech_buff[i] / scale;
+    }
+    free(speech_buff);
+    return true;
+  } else {
+    free(speech_buff);
+    return false;
+  }
+}

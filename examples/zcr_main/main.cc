@@ -219,6 +219,14 @@ static bool is_file_exist(const char *fileName) {
     return infile.good();
 }
 
+// 函数声明
+void sense_voice_process_stream(struct sense_voice_context *ctx, const sense_voice_params &params, std::vector<float> &pcmf32);
+void sense_voice_process_batch(struct sense_voice_context *ctx, const sense_voice_params &params,
+                               std::vector<sense_voice_segment> &batch);
+bool check_and_process_batch_if_full(struct sense_voice_context *ctx, const sense_voice_params &params,
+                                     std::vector<sense_voice_segment> &current_batch, size_t &current_batch_size,
+                                     size_t new_segment_size, size_t batch_samples);
+
 /**
  * This the arbitrary data which will be passed to each callback.
  * Later on we can for example add operation or tensor name filter from the CLI arg, or a file descriptor to dump the tensor.
@@ -315,29 +323,31 @@ void sense_voice_free(struct sense_voice_context *ctx) {
     }
 }
 
-void sense_voice_split_segments(struct sense_voice_context *ctx, const sense_voice_params &params, std::vector<double> &pcmf32) {
-    int L_nomute = -1, L_mute = -1, R_mute = -1;// [L_nomute, R_nomute)永远为需要解析的段落，[L_mute, R_mute)永远为最近一段静音空挡
+// 流式音频处理：从输入音频分批读取并处理
+void sense_voice_process_stream(struct sense_voice_context *ctx, const sense_voice_params &params, std::vector<float> &pcmf32) {
     const int n_sample_step = params.chunk_size * 1e-3 * SENSE_VOICE_SAMPLE_RATE;
     const int keep_nomute_step = params.chunk_size * params.min_mute_chunks * 1e-3 * SENSE_VOICE_SAMPLE_RATE;
     const int max_nomute_step = params.chunk_size * params.max_nomute_chunks * 1e-3 * SENSE_VOICE_SAMPLE_RATE;
-    // const bool use_vad = (n_samples_step <= 0);
+    const size_t batch_samples = params.max_chunks_in_batch * params.chunk_size * 1e-3 * SENSE_VOICE_SAMPLE_RATE;
+
+    std::vector<sense_voice_segment> current_batch;
+    size_t current_batch_size = 0;
+
+    int L_nomute = -1, L_mute = -1, R_mute = -1;
+
     for (int i = 0; i < int(pcmf32.size()); i += n_sample_step) {
         int R_this_chunk = std::min(i + n_sample_step, int(pcmf32.size()));
         bool isnomute = false;
 
-        // 修复silero-vad的chunk数据准备，确保与原始方法处理相同的数据范围
-        int actual_chunk_size = R_this_chunk - i;  // 使用与能量检测相同的chunk大小
-
-        // 准备与原始方法相同大小的chunk数据，但最少640样本以满足VAD要求
+        // VAD检测
+        int actual_chunk_size = R_this_chunk - i;
         int vad_chunk_size = std::max(640, actual_chunk_size);
         std::vector<float> chunk(vad_chunk_size, 0);
 
-        // 填充实际的音频数据（确保索引正确）
         for (int j = 0; j < actual_chunk_size && i + j < int(pcmf32.size()); j++) {
-            chunk[j] = static_cast<float>(pcmf32[i + j]) / 32768.0f;
+            chunk[j] = pcmf32[i + j] / 32768.0f;
         }
 
-        // 如果chunk不够640样本，用最后一个样本填充（而不是反射填充）
         if (actual_chunk_size < 640) {
             float last_sample = (actual_chunk_size > 0) ? chunk[actual_chunk_size - 1] : 0.0f;
             for (int j = actual_chunk_size; j < 640; j++) {
@@ -349,61 +359,128 @@ void sense_voice_split_segments(struct sense_voice_context *ctx, const sense_voi
         if (silero_vad_encode_internal(*ctx, *ctx->state, chunk, params.n_threads, speech_prob)) {
             isnomute = (speech_prob >= params.speech_prob_threshold);
         } else {
-            // 如果VAD失败，回退到能量检测
-            isnomute = vad_energy_zcr<double>(pcmf32.begin() + i, R_this_chunk - i, SENSE_VOICE_SAMPLE_RATE);
+            // 转换为double用于兼容原有的vad_energy_zcr函数
+            std::vector<double> pcm_double(pcmf32.begin() + i, pcmf32.begin() + R_this_chunk);
+            isnomute = vad_energy_zcr<double>(pcm_double.begin(), R_this_chunk - i, SENSE_VOICE_SAMPLE_RATE);
         }
 
-        // fprintf(stderr, "Mute || L_mute = %d, R_Mute = %d, L_nomute = %d, R_this_chunk = %d, keep_nomute_step = %d\n", L_mute, R_mute, L_nomute, R_this_chunk, keep_nomute_step);
+        // 音频分段逻辑
         if (L_nomute >= 0 && R_this_chunk - L_nomute >= max_nomute_step) {
             int R_nomute = L_mute >= 0 && L_mute >= L_nomute ? L_mute : R_this_chunk;
-            sense_voice_segment pcmf_tmp;
-            pcmf_tmp.t0 = L_nomute;
-            pcmf_tmp.t1 = R_nomute;
-            // std::transform(pcmf32.begin() + L_nomute, pcmf32.end() + R_nomute, pcmf_tmp.samples.begin(), [](double val){return static_cast<float>(val);});
-            pcmf_tmp.samples = std::vector<double>(pcmf32.begin() + L_nomute, pcmf32.begin() + R_nomute);
-            ctx->state->result_all.push_back(pcmf_tmp);
+            sense_voice_segment segment;
+            segment.t0 = L_nomute;
+            segment.t1 = R_nomute;
+            // 转换为double存储（保持与现有代码的兼容性）
+            segment.samples = std::vector<double>(pcmf32.begin() + L_nomute, pcmf32.begin() + R_nomute);
+
+            // 使用优化的批处理函数检查并处理满载的batch
+            size_t segment_size = segment.samples.size();
+            check_and_process_batch_if_full(ctx, params, current_batch, current_batch_size, 
+                                          segment_size, batch_samples);
+            
+            current_batch.push_back(segment);
+            current_batch_size += segment_size;
 
             if (!isnomute) L_nomute = -1;
-            else if (R_mute >= 0 && L_mute >= L_nomute)
-                L_nomute = R_mute;
-            else
-                L_nomute = i;
+            else if (R_mute >= 0 && L_mute >= L_nomute) L_nomute = R_mute;
+            else L_nomute = i;
             L_mute = R_mute = -1;
             continue;
         }
+
         if (isnomute) {
             if (L_nomute < 0) L_nomute = i;
         } else {
             if (R_mute != i) L_mute = i;
             R_mute = R_this_chunk;
             if (L_mute >= L_nomute && L_nomute >= 0 && R_this_chunk - L_mute >= keep_nomute_step) {
-                // printf("2222: %d %d %d %d %d\n", L_nomute, R_nomute, L_mute, i, R_this_chunk);
-                sense_voice_segment pcmf_tmp;
-                pcmf_tmp.t0 = L_nomute;
-                pcmf_tmp.t1 = L_mute;
-                // std::transform(pcmf32.begin() + L_nomute, pcmf32.end() + L_mute, pcmf_tmp.samples.begin(), [](double val){return static_cast<float>(val);});
-                pcmf_tmp.samples = std::vector<double>(pcmf32.begin() + L_nomute, pcmf32.begin() + L_mute);
-                ctx->state->result_all.push_back(pcmf_tmp);
+                sense_voice_segment segment;
+                segment.t0 = L_nomute;
+                segment.t1 = L_mute;
+                segment.samples = std::vector<double>(pcmf32.begin() + L_nomute, pcmf32.begin() + L_mute);
+
+                // 使用优化的批处理函数检查并处理满载的batch
+                size_t segment_size = segment.samples.size();
+                check_and_process_batch_if_full(ctx, params, current_batch, current_batch_size, 
+                                              segment_size, batch_samples);
+                
+                current_batch.push_back(segment);
+                current_batch_size += segment_size;
+
                 if (!isnomute) L_nomute = -1;
-                else if (R_mute >= 0)
-                    L_nomute = R_mute;
-                else
-                    L_nomute = i;
+                else if (R_mute >= 0) L_nomute = R_mute;
+                else L_nomute = i;
                 L_mute = R_mute = -1;
             }
         }
     }
-    // 最后一段
+
+    // 处理最后一段
     if (L_nomute >= 0) {
-        int R_nomute = pcmf32.size();
-        sense_voice_segment pcmf_tmp;
-        pcmf_tmp.t0 = L_nomute;
-        pcmf_tmp.t1 = R_nomute;
-        // std::transform(pcmf32.begin() + L_nomute, pcmf32.end() + R_nomute, pcmf_tmp.samples.begin(), [](double val){return static_cast<float>(val);});
-        pcmf_tmp.samples = std::vector<double>(pcmf32.begin() + L_nomute, pcmf32.begin() + R_nomute);
-        ctx->state->result_all.push_back(pcmf_tmp);
-        L_nomute = L_mute = R_mute = -1;
+        sense_voice_segment segment;
+        segment.t0 = L_nomute;
+        segment.t1 = pcmf32.size();
+        segment.samples = std::vector<double>(pcmf32.begin() + L_nomute, pcmf32.end());
+
+        // 使用优化的批处理函数检查并处理满载的batch  
+        size_t segment_size = segment.samples.size();
+        check_and_process_batch_if_full(ctx, params, current_batch, current_batch_size, 
+                                      segment_size, batch_samples);
+        
+        current_batch.push_back(segment);
     }
+
+    // 处理最后的batch
+    if (!current_batch.empty()) {
+        sense_voice_process_batch(ctx, params, current_batch);
+    }
+}
+
+// 处理一个batch并清理计算图缓冲区
+void sense_voice_process_batch(struct sense_voice_context *ctx, const sense_voice_params &params,
+                               std::vector<sense_voice_segment> &batch) {
+    // 清理之前的结果
+    ctx->state->result_all.clear();
+    ctx->state->segmentIDs.clear();
+
+    // 将batch中的segment添加到result_all中
+    for (size_t i = 0; i < batch.size(); i++) {
+        ctx->state->result_all.push_back(batch[i]);
+        ctx->state->segmentIDs.push_back(i);
+    }
+
+    // 处理batch
+    sense_voice_full_params wparams = sense_voice_full_default_params(SENSE_VOICE_SAMPLING_GREEDY);
+    wparams.language = params.language.c_str();
+    wparams.n_threads = params.n_threads;
+    wparams.debug_mode = params.debug_mode;
+
+    sense_voice_batch_full(ctx, wparams);
+    sense_voice_batch_print_output(ctx, params.use_prefix, params.use_itn);
+
+    // 清理处理后的结果以释放内存
+    ctx->state->result_all.clear();
+    ctx->state->segmentIDs.clear();
+}
+
+// 检查batch是否满载，如果满载则处理并清空
+bool check_and_process_batch_if_full(struct sense_voice_context *ctx, const sense_voice_params &params,
+                                     std::vector<sense_voice_segment> &current_batch, size_t &current_batch_size,
+                                     size_t new_segment_size, size_t batch_samples) {
+    if (!current_batch.empty() && 
+        (current_batch_size + new_segment_size > batch_samples || 
+         current_batch.size() >= params.max_batch)) {
+        
+        // 处理当前batch
+        sense_voice_process_batch(ctx, params, current_batch);
+        
+        // 清空batch准备下一轮
+        current_batch.clear();
+        current_batch_size = 0;
+        
+        return true; // 表示已处理了一个batch
+    }
+    return false; // 表示未处理batch
 }
 
 int main(int argc, char **argv) {
@@ -493,7 +570,7 @@ int main(int argc, char **argv) {
         const auto fname_inp = params.fname_inp[f];
         const auto fname_out = f < (int) params.fname_out.size() && !params.fname_out[f].empty() ? params.fname_out[f] : params.fname_inp[f];
 
-        std::vector<double> pcmf32;// mono-channel F32 PCM
+        std::vector<float> pcmf32;// mono-channel F32 PCM
 
         int sample_rate;
         if (!::load_wav_file(fname_inp.c_str(), &sample_rate, pcmf32)) {
@@ -518,47 +595,8 @@ int main(int argc, char **argv) {
         }
 
         {
-            sense_voice_full_params wparams = sense_voice_full_default_params(SENSE_VOICE_SAMPLING_GREEDY);
-            wparams.language = params.language.c_str();
-            wparams.n_threads = params.n_threads;
-            wparams.offset_ms = params.offset_t_ms;
-            wparams.duration_ms = params.duration_ms;
-            wparams.debug_mode = params.debug_mode;
-            sense_voice_split_segments(ctx, params, pcmf32);
-            // ctx->state->result_all需要分块识别
-            {
-                const size_t batch_samples = params.max_chunks_in_batch * params.chunk_size * 1e-3 * SENSE_VOICE_SAMPLE_RATE;
-                size_t max_len = 0, batch_L = ctx->state->result_all.size();
-                for (size_t i = 0; i < ctx->state->result_all.size(); i++) {
-                    if (batch_L >= ctx->state->result_all.size()) {
-                        batch_L = i;
-                        max_len = ctx->state->result_all[i].samples.size();
-                        ctx->state->segmentIDs.push_back(i);
-                        continue;// 这里可以直接推进，收拢到下一个循环处理[batch_L, i]之间的关系
-                    }
-                    max_len = std::max(max_len, ctx->state->result_all[i].samples.size());
-                    // 这里确保了i>batch_L
-                    if (max_len * (i - batch_L + 1) > batch_samples || i - batch_L >= params.max_batch) {
-                    // if (i - batch_L > 0) {
-                    // if (i - batch_L > 1) {
-                        sense_voice_batch_full(ctx, wparams);
-                        sense_voice_batch_print_output(ctx, params.use_prefix, params.use_itn);
-                        batch_L = i;
-                        max_len = ctx->state->result_all[i].samples.size();
-                        ctx->state->segmentIDs.clear();
-                    }
-                    ctx->state->segmentIDs.push_back(i);
-                }
-                // 最后一组
-                if (batch_L < ctx->state->result_all.size()) {
-                    // 识别全部即可
-                    sense_voice_batch_full(ctx, wparams);
-                    sense_voice_batch_print_output(ctx, params.use_prefix, params.use_itn);
-                    ctx->state->segmentIDs.clear();
-                    batch_L = ctx->state->result_all.size();
-                    max_len = 0;
-                }
-            }
+            // 使用新的流式处理函数
+            sense_voice_process_stream(ctx, params, pcmf32);
         }
     }
     sense_voice_free(ctx);
