@@ -60,7 +60,7 @@ struct ggml_cgraph *sense_voice_build_graph_ctc_decoder(sense_voice_context &ctx
     ggml_cgraph *gf = ggml_new_graph_custom(ctx0, SENSEVOICE_DECODER_MAX_NODES, false);
 
     ggml_tensor *encoder_out = ggml_new_tensor_3d(ctx0, state.encoder_out->type,
-                                                  state.encoder_out->ne[0], state.encoder_out->ne[1], 
+                                                  state.encoder_out->ne[0], state.encoder_out->ne[1],
                                                   state.encoder_out->ne[2]);
     ggml_set_name(encoder_out, "encoder_out");
     ggml_set_input(encoder_out);
@@ -125,13 +125,18 @@ bool sense_voice_decode_internal(sense_voice_context &ctx,
             }
             else {
                 const int32_t n_logits = argmax_logit->ne[0] * argmax_logit->ne[1];
-                // Get the tensor data into a temporary buffer
-                std::vector<int> temp_buffer(n_logits);
-                ggml_backend_tensor_get(argmax_logit, temp_buffer.data(), 0, sizeof(int) * n_logits);
+                // Use state->ids as temporary buffer if it's large enough, avoiding extra allocation
+                if (state.ids.size() < n_logits) {
+                    state.ids.resize(n_logits);
+                }
+                ggml_backend_tensor_get(argmax_logit, state.ids.data(), 0, sizeof(int) * n_logits);
+
                 for(int32_t i = 0; i < argmax_logit->ne[1]; i++)
                 {
                     int posL = i * argmax_logit->ne[0];
-                    state.result_all[state.segmentIDs[i]].tokens = std::vector<int>(temp_buffer.begin() + posL, temp_buffer.begin() + posL + argmax_logit->ne[0]);
+                    // Direct assignment without creating temporary vector
+                    auto& tokens = state.result_all[state.segmentIDs[i]].tokens;
+                    tokens.assign(state.ids.begin() + posL, state.ids.begin() + posL + argmax_logit->ne[0]);
                 }
             }
         }

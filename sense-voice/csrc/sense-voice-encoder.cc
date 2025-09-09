@@ -8,7 +8,7 @@
 #include <map>
 #include <string>
 #include <vector>
-#define SENSE_VOICE_ENCODER_MAX_NODES 8192
+#define SENSE_VOICE_ENCODER_MAX_NODES 6144
 #define WARP_SIZE 32
 // faster matrix multiplications for tensors that do not have dimension 0 divisible by "pad"
 // the idea is to represent the original matrix multiplication:
@@ -83,13 +83,7 @@ static struct ggml_tensor *encoder_layer_sanm_forward(const sense_voice_hparams 
     const int n_head = hparams.n_encoder_attention_heads;
     auto state = sctx.state;
 
-    struct ggml_tensor *residual = nullptr;
-
-    if (layer.e_norm_w1->ne[0] == layer.e_norm_w2->ne[0]) {
-        residual = ggml_cpy(
-                ctx0, cur,
-                ggml_new_tensor_3d(ctx0, cur->type, cur->ne[0], cur->ne[1], cur->ne[2]));
-    }
+    struct ggml_tensor *residual = cur; // Use original tensor directly instead of copying
 
     {
         // layer norm
@@ -174,22 +168,10 @@ static struct ggml_tensor *encoder_layer_sanm_forward(const sense_voice_hparams 
                 // same in pytorch : F.conv1d(input, weight, bias=None, stride=1, padding=1, dilation=1, groups=n_state)
                 struct ggml_tensor * a = layer.e_attn_fsmn_w;
                 struct ggml_tensor * b = ggml_cont(ctx0, ggml_transpose(ctx0, V));
-                // Process each batch separately and concatenate results
-                // for (int i = 0; i < b->ne[2]; i++) {
-                //     // View for current batch
-                //     struct ggml_tensor *b_batch = ggml_view_3d(ctx0, b, b->ne[0], b->ne[1], 1, b->nb[1], b->nb[2], i * b->nb[2]);
-                //     struct ggml_tensor *im2col = ggml_im2col(ctx0, a, ggml_reshape_4d(ctx0, b_batch, b_batch->ne[0], 1, b_batch->ne[1], b_batch->ne[2] * b_batch->ne[3]), 1, 0, padding, 0, 1, 0, false, GGML_TYPE_F32);
-                //     struct ggml_tensor * result = ggml_mul_mat(ctx0, a, im2col);
-                //     struct ggml_tensor * fsmn_memory_batch = ggml_reshape_3d(ctx0, result, im2col->ne[1], b_batch->ne[1], b_batch->ne[2]);
-                //     if (fsmn_memory == nullptr) {
-                //         fsmn_memory = fsmn_memory_batch;
-                //     } else {
-                //         fsmn_memory = ggml_concat(ctx0, fsmn_memory, fsmn_memory_batch, 2);
-                //     }
-                // }
+
                 struct ggml_tensor * im2col = ggml_im2col(ctx0, a, ggml_reshape_4d(ctx0, b, b->ne[0], 1, b->ne[1] * b->ne[2], b->ne[3]), 1, 0, padding, 0, 1, 0, false, GGML_TYPE_F32);
                 im2col = ggml_reshape_4d(ctx0, im2col, im2col->ne[0], im2col->ne[1], im2col->ne[2] / n_batch, n_batch);
-                a = ggml_repeat(ctx0, ggml_cast(ctx0, a, GGML_TYPE_F32), ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, a->ne[0], a->ne[1], a->ne[2], n_batch));
+                // a = ggml_repeat(ctx0, ggml_cast(ctx0, a, GGML_TYPE_F32), ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, a->ne[0], a->ne[1], a->ne[2], n_batch));
                 struct ggml_tensor * result = ggml_mul_mat(ctx0, a, im2col);
                 fsmn_memory = ggml_reshape_3d(ctx0, result, im2col->ne[1], im2col->ne[2], im2col->ne[3]);
             }
@@ -227,8 +209,7 @@ static struct ggml_tensor *encoder_layer_sanm_forward(const sense_voice_hparams 
         } else{
             // K * Q
             struct ggml_tensor *KQ = ggml_mul_mat(ctx0, K_h, Q_h);
-
-            struct ggml_tensor *KQ_soft_max = ggml_soft_max_ext(ctx0, KQ, nullptr, KQscale, 0.0f);
+            struct ggml_tensor *KQ_soft_max = ggml_soft_max_inplace(ctx0, ggml_scale_inplace(ctx0, KQ, KQscale));
 
 
             ggml_tensor *KQV = ggml_mul_mat(
@@ -250,26 +231,24 @@ static struct ggml_tensor *encoder_layer_sanm_forward(const sense_voice_hparams 
         }
     }
 
-    residual = ggml_cpy(
-            ctx0, cur,
-            ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, cur->ne[0], cur->ne[1], cur->ne[2]));
+    ggml_tensor *residual2 = cur;
     {
         // layer norm after attention
         // cur = ln_0_w*cur + ln_0_b
         cur = ggml_norm(ctx0, cur, hparams.eps);
-        cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.e_norm_w2), layer.e_norm_b2);
+        cur = ggml_add_inplace(ctx0, ggml_mul_inplace(ctx0, cur, layer.e_norm_w2), layer.e_norm_b2);
     }
 
     {
         // position-wise feed forward layer
-        cur = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.e_mlp_w1, cur),
+        cur = ggml_add_inplace(ctx0, ggml_mul_mat(ctx0, layer.e_mlp_w1, cur),
                        layer.e_mlp_b1);
-        cur = ggml_relu(ctx0, cur);
-        cur = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.e_mlp_w2, cur),
+        cur = ggml_relu_inplace(ctx0, cur);
+        cur = ggml_add_inplace(ctx0, ggml_mul_mat(ctx0, layer.e_mlp_w2, cur),
                        layer.e_mlp_b2);
     }
     // residual after position wise feed forward
-    cur = ggml_add(ctx0, cur, residual);
+    cur = ggml_add_inplace(ctx0, cur, residual2);
     return cur;
 
 }

@@ -11,7 +11,7 @@
 #include <functional>
 #include <thread>
 
-#define SENSE_VOICE_MAX_NODES 8192
+#define SENSE_VOICE_MAX_NODES 6144
 #define SENSE_VOICE_MAX_DECODERS 8
 #define SENSE_VOICE_CHUNK_SIZE 20
 #define SENSE_VOICE_FEATURES_DIM 560
@@ -697,7 +697,7 @@ int sense_voice_pcm_to_feature_with_state(struct sense_voice_context *ctx,
             state->feature.buffer = nullptr;
         }
         state->feature.tensor = nullptr;
-        
+
         // init features
         state->feature.n_len = state->feature.data.size() / (state->feature.n_mel * state->feature.lfr_m);
         state->feature.ctx = ggml_init({ggml_tensor_overhead(), nullptr, true});
@@ -837,7 +837,7 @@ int sense_voice_batch_pcm_to_feature_with_state(struct sense_voice_context *ctx,
             state->feature.buffer = nullptr;
         }
         state->feature.tensor = nullptr;
-        
+
         // init features
         state->feature.n_len = state->feature.data.size() / (state->feature.n_mel * state->feature.lfr_m);
         state->feature.ctx = ggml_init({ggml_tensor_overhead(), nullptr, true});
@@ -916,7 +916,7 @@ int sense_voice_batch_full(struct sense_voice_context *ctx, const sense_voice_fu
 
 int sense_voice_batch_pcmf(struct sense_voice_context *ctx, const sense_voice_full_params &params, std::vector<std::vector<float>> &pcmf32,
                            size_t max_batch_len, size_t max_batch_cnt,
-                           bool use_prefix, bool use_itn) 
+                           bool use_prefix, bool use_itn)
 {
     // 还是要有ctx，重复生成会重复读取模型，有点耗性能
     // ctx中的参数需要在外面赋值，外面的参数形态各异，带不进来
