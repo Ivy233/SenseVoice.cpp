@@ -66,8 +66,7 @@ struct sense_voice_stream_params {
     std::string audio_out;  // 用于输出音频流到文件
 
     // silero-vad 参数
-    float threshold = 0.5f;
-    float neg_threshold = 0.35f;
+    float speech_prob_threshold = 0.1f;
 };
 
 
@@ -91,8 +90,7 @@ void sense_voice_stream_usage(int /*argc*/, char **argv, const sense_voice_strea
     fprintf(stderr, "  -ng,      --no-gpu            [%-7s] [SenseVoice] disable GPU inference\n", params.use_gpu ? "false" : "true");
     fprintf(stderr, "  -fa,      --flash-attn        [%-7s] [SenseVoice] flash attention during inference\n", params.flash_attn ? "true" : "false");
     fprintf(stderr, "            --use-itn           [%-7s] [SenseVoice] Filter duplicate tokens when outputting\n", params.use_itn ? "true" : "false");
-    fprintf(stderr, "            --vad-threshold     [%-7.2f] [VAD] speech probability threshold\n", params.threshold);
-    fprintf(stderr, "            --vad-neg-threshold [%-7.2f] [VAD] non-speech probability threshold\n", params.neg_threshold);
+    fprintf(stderr, "  -spt      --speech-prob-threshold [%-7.2f] [VAD] speech probability threshold for VAD\n", params.speech_prob_threshold);
     fprintf(stderr, "\n");
 }
 
@@ -134,10 +132,8 @@ static bool get_stream_params(int argc, char **argv, sense_voice_stream_params &
             params.chunk_size = std::stoi(argv[++i]);
         } else if (arg == "--use-itn") {
             params.use_itn = true;
-        } else if (arg == "--vad-threshold") {
-            params.threshold = std::stof(argv[++i]);
-        } else if (arg == "--vad-neg-threshold") {
-            params.neg_threshold = std::stof(argv[++i]);
+        } else if (arg == "--speech-prob-threshold" || arg == "-spt") {
+            params.speech_prob_threshold = std::stof(argv[++i]);
         }
 
         else {
@@ -156,6 +152,22 @@ void sense_voice_free(struct sense_voice_context *ctx) {
 
         ggml_backend_buffer_free(ctx->model.buffer);
 
+        // 释放VAD相关资源 - 添加空指针检查
+        if (ctx->state) {
+            if (ctx->state->vad_ctx) {
+                ggml_free(ctx->state->vad_ctx);
+                ctx->state->vad_ctx = nullptr;
+            }
+            if (ctx->state->vad_lstm_hidden_state_buffer) {
+                ggml_backend_buffer_free(ctx->state->vad_lstm_hidden_state_buffer);
+                ctx->state->vad_lstm_hidden_state_buffer = nullptr;
+            }
+            if (ctx->state->vad_lstm_context_buffer) {
+                ggml_backend_buffer_free(ctx->state->vad_lstm_context_buffer);
+                ctx->state->vad_lstm_context_buffer = nullptr;
+            }
+        }
+
         sense_voice_free_state(ctx->state);
 
         delete ctx->model.model->encoder;
@@ -169,12 +181,9 @@ int main(int argc, char **argv) {
     sense_voice_stream_params params;
     if (get_stream_params(argc, argv, params) == false) return 1;
 
-    // VAD 常量定义（与 main.cc 保持一致）
-    #define CHUNK_SIZE 512
-    #define CONTEXT_SIZE 576
-    #define SENSE_VOICE_VAD_CHUNK_PAD_SIZE 64
-    #define VAD_LSTM_STATE_MEMORY_SIZE 2048
-    #define VAD_LSTM_STATE_DIM 128
+    // VAD 常量定义（与 zcr_main/main.cc 保持一致）
+    const int VAD_LSTM_STATE_MEMORY_SIZE = 2048;
+    const int VAD_LSTM_STATE_DIM = 128;
 
     const int n_sample_step = params.chunk_size * 1e-3 * SENSE_VOICE_SAMPLE_RATE;
     const int keep_nomute_step = params.chunk_size * params.min_mute_chunks * 1e-3 * SENSE_VOICE_SAMPLE_RATE;
@@ -361,51 +370,39 @@ int main(int argc, char **argv) {
                 // 使用 silero-vad 替换 vad_energy_zcr
                 bool isnomute = false;
 
-                                // 准备 CONTEXT_SIZE 的 chunk 数据，与 main.cc 保持一致
-                std::vector<float> chunk(CONTEXT_SIZE + SENSE_VOICE_VAD_CHUNK_PAD_SIZE, 0);
+                // VAD检测 - 使用zcr_main/main.cc的方法
+                int actual_chunk_size = n_sample_step;
+                int vad_chunk_size = std::max(640, actual_chunk_size);
+                std::vector<float> vad_chunk(vad_chunk_size, 0);
+                
                 int start_idx = i - idenitified_floats;
-
-                // 修复：使用更小的窗口进行VAD检测，避免超出边界
-                int vad_chunk_start = std::max(0, start_idx);
-                int vad_chunk_end = std::min(static_cast<int>(pcmf32.size()), vad_chunk_start + CONTEXT_SIZE);
-
-                for (int j = 0; j < CONTEXT_SIZE; j++) {
-                    if (vad_chunk_start + j < vad_chunk_end) {
-                        // 注意：pcmf32是double类型，需要正确转换
-                        chunk[j] = static_cast<float>(pcmf32[vad_chunk_start + j]);
-                    } else {
-                        chunk[j] = 0;
+                
+                // 确保不越界访问
+                for (int j = 0; j < actual_chunk_size && start_idx + j < pcmf32.size(); j++) {
+                    if (start_idx + j >= 0) {
+                        vad_chunk[j] = static_cast<float>(pcmf32[start_idx + j]) / 32768.0f;
                     }
                 }
-                // 实现反射填充
-                for (int j = CONTEXT_SIZE; j < chunk.size(); j++) {
-                    int reflect_idx = 2 * CONTEXT_SIZE - j - 2;
-                    if (reflect_idx >= 0 && reflect_idx < CONTEXT_SIZE) {
-                        chunk[j] = chunk[reflect_idx];
-                    } else {
-                        chunk[j] = 0;
+                
+                // 如果实际chunk小于640，用最后一个样本值填充
+                if (actual_chunk_size < 640) {
+                    float last_sample = (actual_chunk_size > 0) ? vad_chunk[actual_chunk_size - 1] : 0.0f;
+                    for (int j = actual_chunk_size; j < 640; j++) {
+                        vad_chunk[j] = last_sample;
                     }
                 }
 
                 float speech_prob = 0;
-                if (silero_vad_encode_internal(*ctx, *ctx->state, chunk, params.n_threads, speech_prob)) {
-                    isnomute = (speech_prob >= params.threshold);
+                if (silero_vad_encode_internal(*ctx, *ctx->state, vad_chunk, params.n_threads, speech_prob)) {
+                    isnomute = (speech_prob >= params.speech_prob_threshold);
                     // 调试信息：显示VAD结果
                     // if (speech_prob > 0.1) { // 只显示有意义的概率
                     //     fprintf(stderr, "VAD: prob=%.3f, threshold=%.3f, isnomute=%d\n",
                     //            speech_prob, params.threshold, isnomute);
                     // }
                 } else {
-                    // fprintf(stderr, "VAD failed, using energy detection\n");
-                    // 如果 VAD 处理失败，回退到简单的能量检测
-                    double energy = 0;
-                    for (int j = 0; j < n_sample_step && start_idx + j < pcmf32.size(); j++) {
-                        if (start_idx + j >= 0) {
-                            energy += pcmf32[start_idx + j] * pcmf32[start_idx + j];
-                        }
-                    }
-                    energy /= n_sample_step;
-                    isnomute = (energy > 1e-3); // 调整能量阈值
+                    // 如果 VAD 处理失败，回退到vad_energy_zcr函数
+                    isnomute = vad_energy_zcr<double>(pcmf32.begin() + start_idx, n_sample_step, SENSE_VOICE_SAMPLE_RATE);
                 }
                 // fprintf(stderr, "Mute || isnomute = %d, ML = %d, MR = %d, NML = %d, NMR = %d, R_new_chunk = %d, i = %d, size = %d, idenitified = %d\n", isnomute, mute.first, mute.second, nomute.first, nomute.second, R_new_chunk, i, pcmf32.size(), idenitified_floats);
                 if (nomute.first == -1) {
