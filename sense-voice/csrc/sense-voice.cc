@@ -810,7 +810,7 @@ int sense_voice_batch_pcm_to_feature_with_state(struct sense_voice_context *ctx,
         max_len = std::max(max_len, state->result_all[segmentID].samples.size());
     for (size_t segmentID: state->segmentIDs)
     {
-        std::vector<double>& pcmf32 = state->result_all[segmentID].samples;
+        std::vector<float>& pcmf32 = state->result_all[segmentID].samples;
         if(pcmf32.size() < max_len) {
             pcmf32.insert(pcmf32.end(), max_len - pcmf32.size(), 0);
         }
@@ -914,7 +914,7 @@ int sense_voice_batch_full(struct sense_voice_context *ctx, const sense_voice_fu
     return 0;
 }
 
-int sense_voice_batch_pcmf(struct sense_voice_context *ctx, const sense_voice_full_params &params, std::vector<std::vector<double>> &pcmf32,
+int sense_voice_batch_pcmf(struct sense_voice_context *ctx, const sense_voice_full_params &params, std::vector<std::vector<float>> &pcmf32,
                            size_t max_batch_len, size_t max_batch_cnt,
                            bool use_prefix, bool use_itn) 
 {

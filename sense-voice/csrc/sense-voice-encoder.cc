@@ -192,22 +192,12 @@ static struct ggml_tensor *encoder_layer_sanm_forward(const sense_voice_hparams 
                 a = ggml_repeat(ctx0, ggml_cast(ctx0, a, GGML_TYPE_F32), ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, a->ne[0], a->ne[1], a->ne[2], n_batch));
                 struct ggml_tensor * result = ggml_mul_mat(ctx0, a, im2col);
                 fsmn_memory = ggml_reshape_3d(ctx0, result, im2col->ne[1], im2col->ne[2], im2col->ne[3]);
-                // if(n_batch > 1){
-                //     printf("n_batch: %d\n", n_batch);
-                //     printf("a: %ld %ld %ld %ld\n", a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
-                //     printf("b: %ld %ld %ld %ld\n", b->ne[0], b->ne[1], b->ne[2], b->ne[3]);
-                //     printf("im2col: %ld %ld %ld %ld\n", im2col->ne[0], im2col->ne[1], im2col->ne[2], im2col->ne[3]);
-                //     printf("result: %ld %ld %ld %ld\n", result->ne[0], result->ne[1], result->ne[2], result->ne[3]);
-                //     printf("fsmn_memory: %ld %ld %ld %ld\n", fsmn_memory->ne[0], fsmn_memory->ne[1], fsmn_memory->ne[2], fsmn_memory->ne[3]);
-                //     printf("V: %ld %ld %ld %ld\n", V->ne[0], V->ne[1], V->ne[2], V->ne[3]);
-                // }
             }
             fsmn_memory = ggml_cont(ctx0, ggml_transpose(ctx0, fsmn_memory));
             fsmn_memory = ggml_add(ctx0, fsmn_memory, V);
             ggml_set_name(fsmn_memory, "fsmn_memory");
         }
 
-        struct ggml_tensor *KQV;
         float KQscale = 1.0f / sqrtf(float(n_state) / n_head);
 
         if(user_flash_attn){
@@ -232,7 +222,7 @@ static struct ggml_tensor *encoder_layer_sanm_forward(const sense_voice_hparams 
                                  ggml_element_size(state->kv_pad.v)*n_state_head,
                                  ggml_element_size(state->kv_pad.v)*n_state*n_ctx_pad,
                                  0);
-            KQV = ggml_flash_attn_ext(ctx0, Q_h, K, V, nullptr, KQscale, 0.0f, 0.0f);
+            ggml_tensor *KQV = ggml_flash_attn_ext(ctx0, Q_h, K, V, nullptr, KQscale, 0.0f, 0.0f);
             cur = ggml_reshape_3d(ctx0, KQV, n_state, n_ctx, n_batch);
         } else{
             // K * Q
@@ -241,18 +231,13 @@ static struct ggml_tensor *encoder_layer_sanm_forward(const sense_voice_hparams 
             struct ggml_tensor *KQ_soft_max = ggml_soft_max_ext(ctx0, KQ, nullptr, KQscale, 0.0f);
 
 
-            KQV = ggml_mul_mat(
+            ggml_tensor *KQV = ggml_mul_mat(
                     ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, V_h)), KQ_soft_max);
             struct ggml_tensor *KQV_merged = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
             cur = ggml_cpy(ctx0,
                            KQV_merged,
                            ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_state, n_ctx, n_batch));
         }
-
-
-
-        cur = ggml_cpy(ctx0, cur,
-                       ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_state, n_ctx, n_batch));
 
         cur = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.e_attn_ln_out_w, cur),
                        layer.e_attn_ln_out_b);
