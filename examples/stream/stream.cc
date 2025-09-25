@@ -50,7 +50,7 @@ struct sense_voice_stream_params {
     int32_t n_threads = std::min(4, (int32_t) std::thread::hardware_concurrency());
     int32_t n_processors = 1;
     int32_t capture_id = -1;
-    int32_t chunk_size = 100;                     // ms
+    int32_t chunk_size = 50;                     // ms
     int32_t max_nomute_chunks = 8000 / chunk_size;// chunks
     int32_t min_mute_chunks = 1000 / chunk_size;  // chunks
 
@@ -374,16 +374,16 @@ int main(int argc, char **argv) {
                 int actual_chunk_size = n_sample_step;
                 int vad_chunk_size = std::max(640, actual_chunk_size);
                 std::vector<float> vad_chunk(vad_chunk_size, 0);
-                
+
                 int start_idx = i - idenitified_floats;
-                
+
                 // 确保不越界访问
                 for (int j = 0; j < actual_chunk_size && start_idx + j < pcmf32.size(); j++) {
                     if (start_idx + j >= 0) {
-                        vad_chunk[j] = static_cast<float>(pcmf32[start_idx + j]) / 32768.0f;
+                        vad_chunk[j] = static_cast<float>(pcmf32[start_idx + j]);
                     }
                 }
-                
+
                 // 如果实际chunk小于640，用最后一个样本值填充
                 if (actual_chunk_size < 640) {
                     float last_sample = (actual_chunk_size > 0) ? vad_chunk[actual_chunk_size - 1] : 0.0f;
@@ -396,9 +396,9 @@ int main(int argc, char **argv) {
                 if (silero_vad_encode_internal(*ctx, *ctx->state, vad_chunk, params.n_threads, speech_prob)) {
                     isnomute = (speech_prob >= params.speech_prob_threshold);
                     // 调试信息：显示VAD结果
-                    // if (speech_prob > 0.1) { // 只显示有意义的概率
-                    //     fprintf(stderr, "VAD: prob=%.3f, threshold=%.3f, isnomute=%d\n",
-                    //            speech_prob, params.threshold, isnomute);
+                    // if (i <= 256000) { // 只显示有意义的概率
+                    //     fprintf(stderr, "VAD: prob=%.3f, threshold=%.3f, isnomute=%d, L_new_chunk=%d, R_new_chunk=%d, i=%d\n",
+                    //            speech_prob, params.speech_prob_threshold, isnomute, L_new_chunk, R_new_chunk, i);
                     // }
                 } else {
                     // 如果 VAD 处理失败，回退到vad_energy_zcr函数
